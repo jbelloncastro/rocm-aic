@@ -439,3 +439,5 @@ COPY --from=build /wheels /
 # and the existing Docker CI all keep getting the runtime image unchanged.  Must
 # be the LAST stage in this file so BuildKit treats it as the default.
 FROM build AS runtime
+
+RUN apt update && apt install -y strace

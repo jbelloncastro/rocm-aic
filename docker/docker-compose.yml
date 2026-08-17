@@ -112,6 +112,7 @@ services:
       dockerfile: docker/Dockerfile
       additional_contexts:
         pip-wheels: ${AIC_PIP_WHEELS_DIR:-/opt/pip-cache/wheels}
+      network: host
       args:
         AIC_VERSION:
         ROCM_VERSION:

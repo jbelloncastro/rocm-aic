@@ -569,10 +569,10 @@ monitoring-logs:
 # Build the two fabric-exporter images (plain `docker build`, so it works on
 # nodes without the compose plugin).  Tag/version overridable via the vars above.
 monitoring-build-exporters:
-	DOCKER_BUILDKIT=1 docker build \
+	DOCKER_BUILDKIT=1 docker build --network host \
 		--build-arg NVME_EXPORTER_VERSION=$(NVME_EXPORTER_VERSION) \
 		-t "$(NVME_EXPORTER_IMAGE)" "$(CURDIR)/monitoring/nvme-exporter"
-	DOCKER_BUILDKIT=1 docker build \
+	DOCKER_BUILDKIT=1 docker build --network host \
 		--build-arg RDMA_EXPORTER_VERSION=$(RDMA_EXPORTER_VERSION) \
 		-t "$(RDMA_EXPORTER_IMAGE)" "$(CURDIR)/monitoring/rdma-exporter"
 	@echo "Built $(NVME_EXPORTER_IMAGE) and $(RDMA_EXPORTER_IMAGE)."
