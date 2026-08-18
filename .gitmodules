@@ -1,0 +1,12 @@
+[submodule "third-party/vllm"]
+	path = third-party/vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "third-party/LMCache"]
+	path = third-party/LMCache
+	url = https://github.com/LMCache/LMCache.git
+[submodule "third-party/nixl"]
+	path = third-party/nixl
+	url = https://github.com/ai-dynamo/nixl.git
+[submodule "third-party/hsa-snoop"]
+	path = third-party/hsa-snoop
+	url = https://github.com/sbates130272/hsa-snoop.git

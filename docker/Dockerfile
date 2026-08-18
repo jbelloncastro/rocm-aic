@@ -10,6 +10,10 @@
 #   hipFile:    included in the ROCm 7.14 base image (GA since 7.14) — no source build needed
 #   NIXL:       ai-dynamo/nixl ${NIXL_REF} + nixl-rocm-ais-mt.patch (ROCm/HIP + AIS_MT)
 #
+#   Source trees for vLLM, LMCache, NIXL, and hsa-snoop are git submodules under
+#   third-party/ (pinned commits), COPY'd into the build context — no GitHub clones
+#   at build time.
+#
 # Two compose services share this single image:
 #   lmcache — standalone lmcache-server (MP mode)
 #               L1:  GPU/CPU DRAM (--l1-size-gb)  OR  hipFile NVMe slab (GDS L1 mode)
@@ -70,15 +74,17 @@ ARG BUILD_JOBS=
 
 # vLLM: built from source at this tag.  Check https://github.com/vllm-project/vllm/tags
 # for the latest release; bump VLLM_REF and rebuild when updating.
-ARG VLLM_GIT_URL=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=v0.26.0
+# ARG VLLM_GIT_URL=https://github.com/vllm-project/vllm.git
+# ARG VLLM_REF=v0.26.0
+ARG VLLM_REF=rocm-aic/v0.1.0
 
 # Pinned component revisions — bump together when validating a new combo.
 # ai-dynamo/nixl release tag + nixl-rocm-ais-mt.patch (ROCm/HIP + AIS_MT).
 # The patch is AIS_MT-only (it no longer relocates upstream GDS_MT), so it applies
 # cleanly on both v1.3.0 and v1.3.1 -- bump NIXL_REF and re-run the patch --check.
-ARG NIXL_GIT_URL=https://github.com/ai-dynamo/nixl.git
-ARG NIXL_REF=v1.3.2
+# ARG NIXL_GIT_URL=https://github.com/ai-dynamo/nixl.git
+# ARG NIXL_REF=v1.3.2
+ARG NIXL_REF=rocm-aic/v0.1.0
 
 # hsa-snoop: HSA AQL queue/dispatch snooper + Prometheus exporter (includes AIS metrics).
 ARG HSA_SNOOP_GIT_URL=https://github.com/sbates130272/hsa-snoop.git
@@ -87,8 +93,9 @@ ARG HSA_SNOOP_REF=v1.0.0
 # LMCache: upstream repo, pinned to the v0.5.3 release tag.
 # All 12 AMD patches in patches/lmcache/ apply cleanly against this tag.
 # Note: LMCache v0.5.2+ is required for vLLM >= 0.26.0.
-ARG LMCACHE_GIT_URL=https://github.com/LMCache/LMCache.git
-ARG LMCACHE_REF=v0.5.3
+# ARG LMCACHE_GIT_URL=https://github.com/LMCache/LMCache.git
+# ARG LMCACHE_REF=v0.5.3
+ARG LMCACHE_REF=rocm-aic/v0.1.0
 
 # Optional: enable UCX fast-path for NIXL (default off).
 ARG AIC_UCX_FAST=
@@ -222,12 +229,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # build step below.
 RUN test -n "$ROCM_ARCH" || { echo "ERROR: ROCM_ARCH is not set"; exit 1; }
 
-RUN git clone --depth 1 --branch "${VLLM_REF}" "${VLLM_GIT_URL}" /app/vllm
+RUN --mount=type=bind,src=../third-party/vllm,dst=/mnt/vllm \
+    git clone --depth 1 --branch "${VLLM_REF}" /mnt/vllm /app/vllm
 
 # Copy only vLLM patches here — adding a LMCache or NIXL patch won't bust
 # the vLLM build cache.  Each patch directory is copied immediately before
 # its own build step for the same reason.
-COPY patches/vllm/ /app/patches/vllm/
+# COPY patches/vllm/ /app/patches/vllm/
 
 # Patch setup.py so _is_hip() short-circuits on VLLM_TARGET_DEVICE=rocm at
 # build time, without probing torch.version.hip before it is installed.
@@ -267,11 +275,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ----- 4. LMCache (upstream release + AMD patches) ---------------------------
 # Shallow-clone the pinned release tag directly (no history/other branches).
-RUN git clone --depth 1 --branch "${LMCACHE_REF}" "${LMCACHE_GIT_URL}" /app/LMCache
+    
+RUN --mount=type=bind,src=../third-party/lmcache,dst=/mnt/lmcache \
+    git clone --depth 1 --branch "${LMCACHE_REF}" /mnt/lmcache /app/LMCache
 
 # Copy LMCache patches just before use — isolated from vLLM and NIXL patches
 # so adding/changing a LMCache patch only invalidates the LMCache build steps.
-COPY patches/lmcache/ /app/patches/lmcache/
+# COPY patches/lmcache/ /app/patches/lmcache/
 
 # Apply every patch under patches/lmcache/ in lexical (filename) order -- the
 # NN- prefixes fix the sequence.  Drop a new NN-*.patch in to include it.
@@ -336,28 +346,18 @@ RUN uv pip uninstall --system \
 # Clone upstream ai-dynamo/nixl, then apply nixl-rocm-ais-mt.patch to add ROCm/HIP
 # detection and the AIS_MT plugin tree.
 COPY docker/scripts /tmp/nixl-scripts
-COPY patches/nixl/ /tmp/nixl-patches/
+# COPY patches/nixl/ /tmp/nixl-patches/
 # Apply every patch under patches/nixl/ (lexical order) to the fresh checkout.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=../third-party/nixl,dst=/mnt/nixl \
     chmod +x /tmp/nixl-scripts/*.sh && \
-    NIXL_GIT_URL="${NIXL_GIT_URL}" NIXL_REF="${NIXL_REF}" NIXL_REQUIRE_ROCM=1 \
-        NIXL_DEST=/tmp/nixl /tmp/nixl-scripts/clone-nixl.sh && \
-    shopt -s nullglob && \
-    nixl_patches=(/tmp/nixl-patches/*.patch) && \
-    if [ "${#nixl_patches[@]}" -eq 0 ]; then \
-        echo "ERROR: no patches found in /tmp/nixl-patches/" >&2; exit 1; \
-    fi && \
-    for patch in "${nixl_patches[@]}"; do \
-        if git -C /tmp/nixl apply --verbose "$patch"; then \
-            echo "[nixl] applied $(basename "$patch")"; \
-        else \
-            echo "ERROR: nixl patch does not apply cleanly: $patch" >&2; exit 1; \
-        fi; \
-    done && \
+    git clone --depth 1 --branch "${NIXL_REF}" /mnt/nixl /tmp/nixl \
     NIXL_SRC=/tmp/nixl \
-        AIS_PATH=/opt/rocm ROCM_PATH=/opt/rocm \
+        AIS_PATH=/opt/rocm \
+        ROCM_PATH=/opt/rocm \
         NIXL_INSTALL_PREFIX=/opt/nixl \
-        NIXL_BUILD_WHEEL=1 NIXL_WHEEL_DIR=/wheels \
+        NIXL_BUILD_WHEEL=1 \
+        NIXL_WHEEL_DIR=/wheels \
         BUILD_JOBS="${BUILD_JOBS}" \
         AIC_UCX_FAST="${AIC_UCX_FAST}" \
         UV_SYSTEM_CERTS=1 \
@@ -378,7 +378,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --prometheus.  At runtime it must run as root in the host PID namespace,
 # privileged (tracefs + pagemap + process_vm_readv), to see the vLLM/LMCache GPU
 # processes -- see monitoring/docker-compose.monitoring.yml.
-RUN git clone --depth 1 --branch "${HSA_SNOOP_REF}" "${HSA_SNOOP_GIT_URL}" /app/hsa-snoop && \
+
+RUN --mount=type=bind,src=../third-party/hsa-snoop,dst=/mnt/hsa-snoop \
+    git clone --depth 1 --branch "${HSA_SNOOP_REF}" /mnt/hsa-snoop /app/hsa-snoop && \
     cmake -S /app/hsa-snoop -B /app/hsa-snoop/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DHSA_SNOOP_PROMETHEUS=ON \
         -DCMAKE_DISABLE_FIND_PACKAGE_hip=ON && \
@@ -439,5 +441,3 @@ COPY --from=build /wheels /
 # and the existing Docker CI all keep getting the runtime image unchanged.  Must
 # be the LAST stage in this file so BuildKit treats it as the default.
 FROM build AS runtime
-
-RUN apt update && apt install -y strace
