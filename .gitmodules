@@ -10,3 +10,6 @@
 [submodule "third-party/hsa-snoop"]
 	path = third-party/hsa-snoop
 	url = https://github.com/sbates130272/hsa-snoop.git
+[submodule "third-party/rocm-systems"]
+	path = third-party/rocm-systems
+	url = git@github.com:jbelloncastro/rocm-systems.git

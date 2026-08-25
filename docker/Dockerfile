@@ -229,8 +229,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # build step below.
 RUN test -n "$ROCM_ARCH" || { echo "ERROR: ROCM_ARCH is not set"; exit 1; }
 
-RUN --mount=type=bind,src=../third-party/vllm,dst=/mnt/vllm \
-    git clone --depth 1 --branch "${VLLM_REF}" /mnt/vllm /app/vllm
+RUN --mount=type=bind,src=third-party/vllm,dst=/mnt/rocm-aic/third-party/vllm \
+    --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
+    git clone --depth 1 --branch "${VLLM_REF}" /mnt/rocm-aic/third-party/vllm /app/vllm
 
 # Copy only vLLM patches here — adding a LMCache or NIXL patch won't bust
 # the vLLM build cache.  Each patch directory is copied immediately before
@@ -269,37 +270,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         TORCH_DONT_CHECK_COMPILER_ABI=1 \
         MAX_JOBS="$(nproc)" \
         CCACHE_DIR=/root/.cache/ccache \
-        VLLM_VERSION_OVERRIDE="${VLLM_REF#v}+rocm" \
+        VLLM_VERSION_OVERRIDE="v0.26.0" \
         pip3 wheel --no-build-isolation --no-deps --no-cache-dir -w /wheels . && \
     pip3 install --no-cache-dir /wheels/vllm-*.whl
 
 # ----- 4. LMCache (upstream release + AMD patches) ---------------------------
 # Shallow-clone the pinned release tag directly (no history/other branches).
     
-RUN --mount=type=bind,src=../third-party/lmcache,dst=/mnt/lmcache \
-    git clone --depth 1 --branch "${LMCACHE_REF}" /mnt/lmcache /app/LMCache
-
-# Copy LMCache patches just before use — isolated from vLLM and NIXL patches
-# so adding/changing a LMCache patch only invalidates the LMCache build steps.
-# COPY patches/lmcache/ /app/patches/lmcache/
-
-# Apply every patch under patches/lmcache/ in lexical (filename) order -- the
-# NN- prefixes fix the sequence.  Drop a new NN-*.patch in to include it.
-RUN cd /app/LMCache && \
-    shopt -s nullglob && \
-    patches=(/app/patches/lmcache/*.patch) && \
-    if [ "${#patches[@]}" -eq 0 ]; then \
-        echo "ERROR: no patches found in /app/patches/lmcache/" >&2; exit 1; \
-    fi && \
-    for patch in "${patches[@]}"; do \
-        if git apply "$patch"; then \
-            echo "Applied: $patch"; \
-        else \
-            echo "ERROR: LMCache patch does not apply cleanly: $patch" >&2; \
-            echo "The LMCache pin (${LMCACHE_REF}) likely drifted; rebase this patch against it." >&2; \
-            exit 1; \
-        fi; \
-    done
+RUN --mount=type=bind,src=third-party/LMCache,dst=/mnt/rocm-aic/third-party/lmcache \
+    --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
+    git clone --depth 1 --branch "${LMCACHE_REF}" /mnt/rocm-aic/third-party/lmcache /app/LMCache
 
 # Build the LMCache wheel (with the AMD patches + HIP extension) and install THAT,
 # instead of `pip install -e .`, so the wheel we publish is byte-for-byte what the
@@ -345,13 +325,38 @@ RUN uv pip uninstall --system \
 # ----- 6. NIXL (ai-dynamo/nixl upstream + nixl-rocm-ais-mt.patch) ------------
 # Clone upstream ai-dynamo/nixl, then apply nixl-rocm-ais-mt.patch to add ROCm/HIP
 # detection and the AIS_MT plugin tree.
-COPY docker/scripts /tmp/nixl-scripts
-# COPY patches/nixl/ /tmp/nixl-patches/
-# Apply every patch under patches/nixl/ (lexical order) to the fresh checkout.
+
+# 6.1 Install deps
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+	    autoconf \
+	    automake \
+	    build-essential \
+	    ca-certificates \
+	    cmake \
+	    git \
+	    libaio-dev \
+	    libibverbs-dev \
+	    libltdl-dev \
+	    libnuma-dev \
+	    librdmacm-dev \
+	    libtool \
+	    liburing-dev \
+	    pkg-config \
+	    rdma-core \
+      libasio-dev \
+      libtomlplusplus-dev
+
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,src=../third-party/nixl,dst=/mnt/nixl \
-    chmod +x /tmp/nixl-scripts/*.sh && \
-    git clone --depth 1 --branch "${NIXL_REF}" /mnt/nixl /tmp/nixl \
+    uv pip install --system meson ninja pybind11 tomlkit
+
+COPY docker/scripts/build-ucx.sh /tmp/nixl-scripts
+RUN chmod +x /tmp/nixl-scripts/build-ucx.sh
+
+# 6.2 UCX
+RUN --mount=type=cache,target=/root/.cache/uv \
     NIXL_SRC=/tmp/nixl \
         AIS_PATH=/opt/rocm \
         ROCM_PATH=/opt/rocm \
@@ -361,7 +366,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         BUILD_JOBS="${BUILD_JOBS}" \
         AIC_UCX_FAST="${AIC_UCX_FAST}" \
         UV_SYSTEM_CERTS=1 \
-        /tmp/nixl-scripts/build-nixl.sh
+        /tmp/nixl-scripts/build-ucx.sh
 
 # ----- 6b. hsa-snoop (HSA AQL queue snooper + Prometheus exporter) -----------
 # GPU dispatch/queue telemetry on :9488 (/metrics), including AIS (AMD Infinity
@@ -379,8 +384,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # privileged (tracefs + pagemap + process_vm_readv), to see the vLLM/LMCache GPU
 # processes -- see monitoring/docker-compose.monitoring.yml.
 
-RUN --mount=type=bind,src=../third-party/hsa-snoop,dst=/mnt/hsa-snoop \
-    git clone --depth 1 --branch "${HSA_SNOOP_REF}" /mnt/hsa-snoop /app/hsa-snoop && \
+RUN --mount=type=bind,src=third-party/hsa-snoop,dst=/mnt/rocm-aic/third-party/hsa-snoop \
+    --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
+    git clone --depth 1 --branch "${HSA_SNOOP_REF}" /mnt/rocm-aic/third-party/hsa-snoop /app/hsa-snoop && \
     cmake -S /app/hsa-snoop -B /app/hsa-snoop/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DHSA_SNOOP_PROMETHEUS=ON \
         -DCMAKE_DISABLE_FIND_PACKAGE_hip=ON && \
@@ -390,6 +396,36 @@ RUN --mount=type=bind,src=../third-party/hsa-snoop,dst=/mnt/hsa-snoop \
     { /usr/local/bin/hsa-snoop --help 2>&1 || true; } | grep -q -- '--prometheus' \
         || { echo "ERROR: hsa-snoop built without Prometheus mode (--prometheus absent)" >&2; exit 1; } && \
     echo "PASS: hsa-snoop v${HSA_SNOOP_REF} with Prometheus exporter (incl. AIS metrics) installed"
+
+# ----- 6b. hipfile -----------
+RUN --mount=type=bind,src=third-party/rocm-systems/projects/hipfile,dst=/mnt/rocm-aic/third-party/hipfile \
+    cmake -S /mnt/rocm-aic/third-party/hipfile -B /app/hipfile/build -G Ninja \
+          -DBUILD_TESTING=OFF \
+          -DGPU_TARGETS=gfx950 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH=/opt/rocm && \
+    cmake --build /app/hipfile/build --parallel "${BUILD_JOBS:-$(nproc)}" && \
+    rm -f /opt/rocm/lib/libhipfile* && \
+    cmake --install /app/hipfile/build
+
+COPY docker/scripts/build-nixl.sh /tmp/nixl-scripts
+RUN chmod +x /tmp/nixl-scripts/build-nixl.sh
+
+# Apply every patch under patches/nixl/ (lexical order) to the fresh checkout.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=third-party/nixl,dst=/mnt/rocm-aic/third-party/nixl \
+    --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
+    git clone --depth 1 --branch "${NIXL_REF}" /mnt/rocm-aic/third-party/nixl /tmp/nixl && \
+    NIXL_SRC=/tmp/nixl \
+        AIS_PATH=/opt/rocm \
+        ROCM_PATH=/opt/rocm \
+        NIXL_INSTALL_PREFIX=/opt/nixl \
+        NIXL_BUILD_WHEEL=1 \
+        NIXL_WHEEL_DIR=/wheels \
+        BUILD_JOBS="${BUILD_JOBS}" \
+        AIC_UCX_FAST="${AIC_UCX_FAST}" \
+        UV_SYSTEM_CERTS=1 \
+        /tmp/nixl-scripts/build-nixl.sh
 
 # ----- 7. Runtime environment ------------------------------------------------
 # Vars from upstream vLLM Dockerfile.rocm added here:
