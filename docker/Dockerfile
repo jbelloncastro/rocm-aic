@@ -55,7 +55,8 @@
 # the default target -- identical to `build`, so existing `docker build` callers
 # are unaffected).  Publishing wheels: `docker build --target wheels
 # --output type=local,dest=<dir>` extracts /wheels without loading the image.
-ARG ROCM_VERSION=7.14.0
+# ARG ROCM_VERSION=7.14.0
+ARG ROCM_VERSION=7.14.1
 # ROCm 7.14 publishes the hipFile-bearing variant as `-full` (not `-complete`).
 ARG ROCM_BASE_IMAGE=rocm/dev-ubuntu-24.04:${ROCM_VERSION}-full
 # ROCM_BASE_IMAGE has a tagged default but remains overridable by callers.
@@ -190,6 +191,144 @@ RUN curl -fsSL "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh && \
     ln -s /root/.local/bin/uv /usr/local/bin/uv && \
     ln -s /root/.local/bin/uvx /usr/local/bin/uvx
 
+#### PYTORCH BUILD
+###
+### Triton Build
+###
+FROM build AS build_triton
+
+ARG TRITON_BRANCH=release/3.8.x
+# 6bbd260 used in vllm rocm-base dockerfile but it does not exist?
+
+ARG TRITON_REPO=https://github.com/ROCm/triton.git
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system pybind11
+
+RUN git clone ${TRITON_REPO} /app/triton
+RUN cd /app/triton \
+    && git checkout ${TRITON_BRANCH} \
+    && if [ ! -f setup.py ]; then cd python; fi \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && mkdir -p /app/triton/install && cp dist/*.whl /app/triton/install
+
+
+###
+### Pytorch build
+###
+FROM build AS build_pytorch
+
+ARG PYTORCH_BRANCH="6bbd260" # release/2.12 as of 08/02
+ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config liblzma-dev
+
+# torch 2.12 emits float->__bf16 libcalls (__truncsfbf2) absent from gcc-11 libgcc; build with gcc-13.
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 --slave /usr/bin/g++ g++ /usr/bin/g++-13
+RUN git clone ${PYTORCH_REPO} /app/pytorch
+RUN cd /app/pytorch && git checkout ${PYTORCH_BRANCH}
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd /app/pytorch \
+    && uv pip install --system -r requirements.txt && git submodule update --init --recursive
+
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y libnuma-dev python3.12-venv
+
+ARG ROCM_ARCH
+ENV PYTORCH_ROCM_ARCH=${ROCM_ARCH}
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /app/pytorch && python3 tools/amd_build/build_amd.py && \
+    export CCACHE_DIR=/root/.cache/ccache && \
+    export CMAKE_C_COMPILER_LAUNCHER=ccache && \
+    export CMAKE_CXX_COMPILER_LAUNCHER=ccache && \
+    CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist
+
+RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install
+
+###
+### Shared PyTorch runtime for dependent builds
+###
+FROM build AS build_pytorch_runtime
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 --slave /usr/bin/g++ g++ /usr/bin/g++-13
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install,ro \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip3 install /install/*.whl
+
+
+###
+### TorchVision build
+###
+FROM build_pytorch_runtime AS build_torchvision
+ARG PYTORCH_VISION_BRANCH="v0.27.1"
+ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
+
+RUN git clone ${PYTORCH_VISION_REPO} vision
+RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH}
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libnuma-dev
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install setuptools wheel packaging
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd vision \
+    && export CMAKE_C_COMPILER_LAUNCHER=ccache \
+    && export CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    && export USE_ROCM=1 \
+    && export USE_CUDA=0 \
+    && export PYTORCH_ROCM_ARCH=${ROCM_ARCH} \
+    && python3 setup.py bdist_wheel
+
+RUN mkdir -p /app/install && find vision/ -type f -name "*.whl" -exec cp {} /app/install/ \;
+
+
+###
+### TorchAudio build
+###
+FROM build_pytorch_runtime AS build_torchaudio
+ARG PYTORCH_AUDIO_BRANCH="v2.11.0"
+ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
+
+RUN git clone ${PYTORCH_AUDIO_REPO} audio
+RUN cd audio && git checkout ${PYTORCH_AUDIO_BRANCH} \
+    && git submodule update --init --recursive
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd audio && pip3 install -r requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install setuptools wheel packaging
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libnuma-dev
+
+ARG ROCM_ARCH
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd audio \
+    && export CMAKE_C_COMPILER_LAUNCHER=ccache \
+    && export CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    && export USE_ROCM=1 \
+    && export USE_CUDA=0 \
+    && export PYTORCH_ROCM_ARCH=${ROCM_ARCH} \
+    && python3 setup.py bdist_wheel
+
+RUN mkdir -p /app/install && find audio/ -type f -name "*.whl" -exec cp {} /app/install/ \;
+
+
 # ----- 3. vLLM (built from source at pinned tag) ---------------------------------
 # Install torch 2.13.0+rocm7.2 from the upstream pytorch.org wheel index.
 #
@@ -206,27 +345,32 @@ RUN curl -fsSL "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh && \
 # passed in via --build-context pip-wheels=<dir> to avoid the 6 GB download.
 # The context is mounted read-only and never baked into the image layer.
 # If the build-context is not provided, falls back to the index URL.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=from=pip-wheels,source=.,target=/opt/pip-cache/wheels,ro \
-    if [ -f /opt/pip-cache/wheels/torch-2.13.0+rocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl ]; then \
-        pip3 install \
-            --find-links /opt/pip-cache/wheels \
-            --prefer-binary \
-            --index-url https://download.pytorch.org/whl/rocm7.2 \
-            "torch==2.13.0+rocm7.2" \
-            "torchvision==0.28.0+rocm7.2"; \
-    else \
-        pip3 install \
-            --timeout 300 \
-            --retries 5 \
-            "torch==2.13.0+rocm7.2" \
-            "torchvision==0.28.0+rocm7.2" \
-            --index-url https://download.pytorch.org/whl/rocm7.2; \
-    fi
+# RUN --mount=type=cache,target=/root/.cache/pip \
+#     --mount=from=pip-wheels,source=.,target=/opt/pip-cache/wheels,ro \
+#     if [ -f /opt/pip-cache/wheels/torch-2.13.0+rocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl ]; then \
+#         pip3 install \
+#             --find-links /opt/pip-cache/wheels \
+#             --prefer-binary \
+#             --index-url https://download.pytorch.org/whl/rocm7.2 \
+#             "torch==2.13.0+rocm7.2" \
+#             "torchvision==0.28.0+rocm7.2"; \
+#     else \
+#         pip3 install \
+#             --timeout 300 \
+#             --retries 5 \
+#             "torch==2.13.0+rocm7.2" \
+#             "torchvision==0.28.0+rocm7.2" \
+#             --index-url https://download.pytorch.org/whl/rocm7.2; \
+#     fi
+
+# Note @jorgeb: installing torch ships with rocprofiler-sdk version that mismatches the one in /opt/rocm
+# so both end up installed in different paths and loaded at the same time
 
 # Validate ROCM_ARCH here — after the torch download so a per-arch build
 # doesn't bust the 6 GB wheel cache.  First use of ROCM_ARCH is in the vLLM
 # build step below.
+FROM build AS build_vllm
+
 RUN test -n "$ROCM_ARCH" || { echo "ERROR: ROCM_ARCH is not set"; exit 1; }
 
 RUN --mount=type=bind,src=third-party/vllm,dst=/mnt/rocm-aic/third-party/vllm \
@@ -258,12 +402,17 @@ RUN cd /app/vllm && \
         done; \
     fi
 
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install,ro \
+    --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install /install/*.whl
+
+RUN mkdir -p /wheels && \
+    echo 'torch==2.12' > /tmp/torch-constraints.txt
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/ccache \
-    mkdir -p /wheels && \
     cd /app/vllm && \
-    printf 'torch==2.13.0+rocm7.2\ntorchvision==0.28.0+rocm7.2\n' > /tmp/torch-constraints.txt && \
-    pip3 install -r requirements/rocm.txt \
+    python3 -m pip install -r requirements/rocm.txt \
         --constraint /tmp/torch-constraints.txt && \
     VLLM_TARGET_DEVICE=rocm \
         PYTORCH_ROCM_ARCH="${ROCM_ARCH}" \
@@ -276,10 +425,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ----- 4. LMCache (upstream release + AMD patches) ---------------------------
 # Shallow-clone the pinned release tag directly (no history/other branches).
+FROM build AS build_lmcache
     
 RUN --mount=type=bind,src=third-party/LMCache,dst=/mnt/rocm-aic/third-party/lmcache \
     --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
     git clone --depth 1 --branch "${LMCACHE_REF}" /mnt/rocm-aic/third-party/lmcache /app/LMCache
+
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install,ro \
+    --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install /install/*.whl
 
 # Build the LMCache wheel (with the AMD patches + HIP extension) and install THAT,
 # instead of `pip install -e .`, so the wheel we publish is byte-for-byte what the
@@ -294,9 +448,20 @@ RUN --mount=type=bind,src=third-party/LMCache,dst=/mnt/rocm-aic/third-party/lmca
 # MAX_JOBS / CMAKE_BUILD_PARALLEL_LEVEL parallelize the HIP extension compile
 # (torch's build_ext is single-threaded otherwise -- the dominant build step).
 # The pip build cache is a BuildKit cache mount, so repeated builds reuse it.
+RUN mkdir -p /wheels && \
+    printf '%s\n' "${ROCM_ARCH%%;*}" > /etc/rocm_target.lst
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libnuma-dev
+
 RUN --mount=type=cache,target=/root/.cache/pip \
-    mkdir -p /wheels && \
-    printf '%s\n' "${ROCM_ARCH%%;*}" > /etc/rocm_target.lst && \
+    cd /app/LMCache/requirements && \
+    python3 -m pip install -r common.txt -r build.txt -r rocm_core.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
     cd /app/LMCache && \
     PYTORCH_ROCM_ARCH="${ROCM_ARCH}" \
         TORCH_DONT_CHECK_COMPILER_ABI=1 \
@@ -311,6 +476,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system "matplotlib>=3.8,<4"
 
+FROM build AS nixl_deps
 # Remove any NIXL wheels that upstream packages may have pulled — we build from source below.
 # Also purge stray CUDA-only deps (cupy-cuda12x, cufile-python, cuda-pathfinder): if they
 # remain, vLLM/LMCache can try to import non-existent CUDA .so files at runtime on ROCm.
@@ -352,14 +518,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system meson ninja pybind11 tomlkit
 
-COPY docker/scripts/build-ucx.sh /tmp/nixl-scripts
+FROM nixl_deps AS build_ucx
+
+COPY docker/scripts/build-ucx.sh /tmp/nixl-scripts/
 RUN chmod +x /tmp/nixl-scripts/build-ucx.sh
 
 # 6.2 UCX
 RUN --mount=type=cache,target=/root/.cache/uv \
     NIXL_SRC=/tmp/nixl \
         AIS_PATH=/opt/rocm \
-        ROCM_PATH=/opt/rocm \
+        ROCM_PATH=${ROCM_PATH:-/opt/rocm} \
         NIXL_INSTALL_PREFIX=/opt/nixl \
         NIXL_BUILD_WHEEL=1 \
         NIXL_WHEEL_DIR=/wheels \
@@ -384,6 +552,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # privileged (tracefs + pagemap + process_vm_readv), to see the vLLM/LMCache GPU
 # processes -- see monitoring/docker-compose.monitoring.yml.
 
+FROM nixl_deps AS build_hsa_snoop
+
 RUN --mount=type=bind,src=third-party/hsa-snoop,dst=/mnt/rocm-aic/third-party/hsa-snoop \
     --mount=type=bind,src=.git,dst=/mnt/rocm-aic/.git \
     git clone --depth 1 --branch "${HSA_SNOOP_REF}" /mnt/rocm-aic/third-party/hsa-snoop /app/hsa-snoop && \
@@ -391,11 +561,13 @@ RUN --mount=type=bind,src=third-party/hsa-snoop,dst=/mnt/rocm-aic/third-party/hs
         -DCMAKE_BUILD_TYPE=Release -DHSA_SNOOP_PROMETHEUS=ON \
         -DCMAKE_DISABLE_FIND_PACKAGE_hip=ON && \
     cmake --build /app/hsa-snoop/build --parallel "${BUILD_JOBS:-$(nproc)}" && \
-    cmake --install /app/hsa-snoop/build --prefix /usr/local && \
+    cmake --install /app/hsa-snoop/build --prefix /app/hsa-snoop/install && \
     test -x /usr/local/bin/hsa-snoop && \
     { /usr/local/bin/hsa-snoop --help 2>&1 || true; } | grep -q -- '--prometheus' \
         || { echo "ERROR: hsa-snoop built without Prometheus mode (--prometheus absent)" >&2; exit 1; } && \
     echo "PASS: hsa-snoop v${HSA_SNOOP_REF} with Prometheus exporter (incl. AIS metrics) installed"
+
+FROM nixl_deps AS build_hipfile
 
 # ----- 6b. hipfile -----------
 RUN --mount=type=bind,src=third-party/rocm-systems/projects/hipfile,dst=/mnt/rocm-aic/third-party/hipfile \
@@ -405,10 +577,12 @@ RUN --mount=type=bind,src=third-party/rocm-systems/projects/hipfile,dst=/mnt/roc
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_PREFIX_PATH=/opt/rocm && \
     cmake --build /app/hipfile/build --parallel "${BUILD_JOBS:-$(nproc)}" && \
-    rm -f /opt/rocm/lib/libhipfile* && \
-    cmake --install /app/hipfile/build
+    cmake --install /app/hipfile/build --prefix /app/hipfile/install
 
-COPY docker/scripts/build-nixl.sh /tmp/nixl-scripts
+
+FROM nixl_deps AS build_nixl
+
+COPY docker/scripts/build-nixl.sh /tmp/nixl-scripts/
 RUN chmod +x /tmp/nixl-scripts/build-nixl.sh
 
 # Apply every patch under patches/nixl/ (lexical order) to the fresh checkout.
@@ -418,7 +592,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 --branch "${NIXL_REF}" /mnt/rocm-aic/third-party/nixl /tmp/nixl && \
     NIXL_SRC=/tmp/nixl \
         AIS_PATH=/opt/rocm \
-        ROCM_PATH=/opt/rocm \
+        ROCM_PATH=${ROCM_PATH:-/opt/rocm} \
         NIXL_INSTALL_PREFIX=/opt/nixl \
         NIXL_BUILD_WHEEL=1 \
         NIXL_WHEEL_DIR=/wheels \
@@ -426,6 +600,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         AIC_UCX_FAST="${AIC_UCX_FAST}" \
         UV_SYSTEM_CERTS=1 \
         /tmp/nixl-scripts/build-nixl.sh
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system fastsafetensors
+
+# RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+#     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+#     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+#       libelf-dev libdw-dev libdw1
+# 
+# RUN --mount=type=bind,src=third-party/rocm-systems/projects/rocprofiler-sdk,dst=/mnt/rocm-aic/third-party/rocprofiler-sdk \
+#     --mount=type=cache,target=/root/.cache/uv \
+#     uv pip install --system -r /mnt/rocm-aic/third-party/rocprofiler-sdk/requirements.txt && \
+#     cmake -S /mnt/rocm-aic/third-party/rocprofiler-sdk -B /app/rocprofiler-sdk/build -G Ninja \
+#           -DBUILD_TESTING=OFF \
+#           -DGPU_TARGETS=gfx950 \
+#           -DCMAKE_BUILD_TYPE=Release \
+#           -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+#           -DCMAKE_PREFIX_PATH=/opt/rocm && \
+#     cmake --build /app/rocprofiler-sdk/build --parallel "${BUILD_JOBS:-$(nproc)}" && \
+#     cmake --install /app/rocprofiler-sdk/build
+
+FROM build AS environment
 
 # ----- 7. Runtime environment ------------------------------------------------
 # Vars from upstream vLLM Dockerfile.rocm added here:
@@ -469,6 +665,12 @@ ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
 #     --target wheels --output type=local,dest=./wheels .
 # The nightly-wheels GitHub workflow uses exactly this to publish the wheels.
 FROM scratch AS wheels
+COPY --from=build_triton /app/triton/install/*.whl /
+COPY --from=build_pytorch /app/install/*.whl /
+# COPY --from=build_torchvision /app/install/*.whl /
+# COPY --from=build_torchaudio /app/install/*.whl /
+COPY --from=build_vllm /wheels /
+COPY --from=build_lmcache /wheels /
 COPY --from=build /wheels /
 
 # ----- 9. Runtime image (default target) -------------------------------------
@@ -476,4 +678,20 @@ COPY --from=build /wheels /
 # runtime image, exactly as before -- Makefile/compose/run-build-distribute.sh
 # and the existing Docker CI all keep getting the runtime image unchanged.  Must
 # be the LAST stage in this file so BuildKit treats it as the default.
-FROM build AS runtime
+FROM environment AS runtime
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libnuma-dev
+
+# COPY --from=build_torchvision /app/install/*.whl /
+# COPY --from=build_torchaudio /app/install/*.whl /
+RUN --mount=type=bind,from=build_triton,src=/app/triton/install/,target=/wheels/triton,ro \
+    --mount=type=bind,from=build_pytorch,src=/app/install/,target=/wheels/pytorch,ro \
+    --mount=type=bind,from=build_torchvision,src=/app/install/,target=/wheels/torchvision,ro \
+    --mount=type=bind,from=build_vllm,src=/wheels/,target=/wheels/vllm,ro \
+    --mount=type=bind,from=build_lmcache,src=/wheels/,target=/wheels/lmcache,ro \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip3 install /wheels/*/*.whl
